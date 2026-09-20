@@ -1,0 +1,96 @@
+name: PR736 Windows baseline comparison
+
+on:
+  push:
+    branches: [ci/pr736-windows-compare]
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Windows / ${{ matrix.label }}
+    runs-on: windows-2025
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: main-baseline
+            ref: 0e7b4fc0fbef6c331d83b37dc8916bad98b8880e
+          - label: pr736
+            ref: 3d90d4c5059a5edcca0d7f15cadfe1579c05f934
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          submodules: true
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: pandoc/actions/setup@v1
+        with:
+          version: '3.11'
+      - name: Install ripgrep
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            choco install ripgrep -y --no-progress
+          fi
+          rg --version
+      - name: Install same dependencies as upstream CI
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: |
+          pip install scikit-build-core pybind11 coverage diff-cover
+          pip install --no-cache-dir algorithm/lazyllm
+          python -c "import lazyllm, pathlib, shutil; shutil.copy2('algorithm/lazyllm/pyproject.toml', pathlib.Path(lazyllm.__path__[0]) / 'pyproject.toml')"
+          pip install -r algorithm/requirements.txt
+          pip install -r tests/algorithm/requirements-test.txt
+      - name: Verify lazyllm install
+        run: |
+          python -c "from lazyllm.tools.agent.skill_manager import SkillManager; print('tools OK')"
+          python -c "from lazyllm.module import ModuleBase; print('module OK')"
+          python -c "from lazyllm import fc_register; print('fc_register OK')"
+      - name: Record environment
+        run: |
+          mkdir -p diagnostics
+          git rev-parse HEAD > diagnostics/commit.txt
+          git submodule status > diagnostics/submodules.txt
+          python -c "import platform; print(platform.platform()); print(platform.python_version())" > diagnostics/platform.txt
+          pip freeze > diagnostics/dependencies.txt
+      - name: Isolated failing test
+        id: isolated
+        continue-on-error: true
+        env:
+          LAZYLLM_INIT_DOC: '1'
+        run: |
+          set -o pipefail
+          coverage run --data-file=.coverage-isolated --source=algorithm -m pytest tests/algorithm/review/test_maintenance_executor.py::test_capacity_is_held_until_cancelled_thread_exits_and_contexts_are_isolated -v --junitxml=diagnostics/isolated.xml 2>&1 | tee diagnostics/isolated.log
+      - name: Full algorithm suite
+        id: full
+        continue-on-error: true
+        env:
+          LAZYLLM_INIT_DOC: '1'
+        run: |
+          set -o pipefail
+          coverage run --source=algorithm -m pytest tests/algorithm/ -v --junitxml=diagnostics/full.xml 2>&1 | tee diagnostics/full.log
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.label }}
+          path: diagnostics/
+          if-no-files-found: warn
+      - name: Report failed test steps
+        if: always()
+        env:
+          ISOLATED: ${{ steps.isolated.outcome }}
+          FULL: ${{ steps.full.outcome }}
+        run: |
+          echo "Isolated test: $ISOLATED"
+          echo "Full suite: $FULL"
+          test "$ISOLATED" = success && test "$FULL" = success
